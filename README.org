@@ -1,11 +1,22 @@
-* My Project
+* Fogcrow
 
-This is a description of my project.
+** Purpose: learn about the resources available in kubernetes
 
-** Installation
+Run kubectl api-resources and then loop over all resources and show whats availabe.  Example:
 
-To install my project, run this command: go install myproject
+```
+kubectl get --all-namespaces flowschemas --context my-cluster-admin@my-cluster
+```
 
 ** Usage
 
-To use my project, run this command: myproject
+#+begin_example
+rm -rf resources
+cd fogcrow
+go build
+./fogcrow --help
+time ./fogcrow
+./fogcrow -context "my-cluster-admin@my-cluster"
+time ./fogcrow -max-channels 3
+time ./fogcrow -max-channels 3 -context "my-cluster-admin@my-cluster"
+#+end_example

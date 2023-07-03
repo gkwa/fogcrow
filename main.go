@@ -2,12 +2,14 @@ package main
 
 import (
 	"bufio"
+	"flag"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 type Resource struct {
@@ -18,8 +20,30 @@ type Resource struct {
 	Kind       string `json:"kind"`
 }
 
+type CommandOutput struct {
+	ResourceName string
+	CommandLog   string
+	Stdout       string
+	Stderr       string
+}
+
 func main() {
-	cmd := exec.Command("kubectl", "api-resources")
+	var context string
+
+	outputDir := flag.String("output", "resources", "Output directory for logs")
+	maxChannels := flag.Int("max-channels", 2, "Maximum number of concurrent goroutines")
+	flag.StringVar(&context, "context", "", "Use kubectl context")
+	flag.Parse()
+	command := []string{"kubectl", "api-resources"}
+
+	if context == "" {
+		fmt.Println("Using default context")
+	} else {
+		command = append(command, "--context", context)
+	}
+
+	cmd := exec.Command(command[0], command[1:]...)
+
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		fmt.Printf("Error creating stdout pipe: %v", err)
@@ -64,44 +88,89 @@ func main() {
 		return
 	}
 
-	err = processResources(resourceList)
+	err = exploreProcessResources(resourceList, *outputDir, *maxChannels, context)
 	if err != nil {
 		fmt.Printf("Error processing resources: %v\n", err)
 		return
 	}
+
+	err = concatenateLogs(*outputDir)
+	if err != nil {
+		fmt.Printf("Error concatenating logs: %v\n", err)
+		return
+	}
 }
 
-func processResources(resources []Resource) error {
+func exploreProcessResources(resources []Resource, outputDir string, maxChannels int, context string) error {
 	fmt.Printf("Parsed resources:\n")
+
+	// Create a channel to control the number of concurrent goroutines
+	concurrency := make(chan struct{}, maxChannels)
+
+	// Create a channel to collect errors from goroutines
+	errCh := make(chan error)
+
+	// Create a wait group to wait for all goroutines to finish
+	var wg sync.WaitGroup
+
 	for _, resource := range resources {
-		fmt.Printf("%#v\n", resource)
-		err := processResource(resource)
-		if err != nil {
-			fmt.Printf("Error processing resource %s: %v\n", resource.Name, err)
-		}
+		wg.Add(1)
+
+		// Launch a goroutine to process each resource concurrently
+		go func(resource Resource) {
+			defer wg.Done()
+
+			concurrency <- struct{}{} // Acquire a slot in the concurrency channel
+			defer func() {
+				<-concurrency // Release the slot in the concurrency channel
+			}()
+
+			output := processResource(resource, outputDir, context)
+			if output.Stderr != "" {
+				errCh <- fmt.Errorf("error processing resource %s: %v", resource.Name, output.Stderr)
+			}
+		}(resource)
 	}
+
+	// Start a goroutine to wait for all goroutines to finish and close the error channel
+	go func() {
+		wg.Wait()
+		close(errCh)
+	}()
+
+	// Collect errors from the error channel
+	for err := range errCh {
+		fmt.Println(err)
+	}
+
 	return nil
 }
 
-func processResource(resource Resource) error {
+func processResource(resource Resource, outputDir string, context string) CommandOutput {
 	command := "kubectl"
 	cmdArgs := []string{"get", "--all-namespaces", resource.Name}
+	if context != "" {
+		cmdArgs = append(cmdArgs, "--context", context)
+	}
 	joined := strings.Join(cmdArgs, " ")
 	commandLog := fmt.Sprintf("Running command: %s %s\n", command, joined)
 
-	outDir := "resources"
-
-	// Create data directory if it doesn't exist
-	err := os.MkdirAll(outDir, os.ModePerm)
-	if err != nil {
-		return fmt.Errorf("error creating data directory: %v", err)
+	output := CommandOutput{
+		ResourceName: resource.Name,
+		CommandLog:   commandLog,
 	}
 
-	// Write command log and output to file
-	filePath := filepath.Join(outDir, resource.Name)
+	err := os.MkdirAll(outputDir, os.ModePerm)
+	if err != nil {
+		output.Stderr = fmt.Sprintf("error creating output directory: %v", err)
+		return output
+	}
+
+	filePath := filepath.Join(outputDir, fmt.Sprintf("%s.log", resource.Name))
 	file, err := os.Create(filePath)
 	if err != nil {
-		return fmt.Errorf("error creating file %s: %v", filePath, err)
+		output.Stderr = fmt.Sprintf("error creating file %s: %v", filePath, err)
+		return output
 	}
 	defer file.Close()
 
@@ -110,45 +179,94 @@ func processResource(resource Resource) error {
 
 	_, err = writer.WriteString(commandLog)
 	if err != nil {
-		return fmt.Errorf("error writing to file %s: %v", filePath, err)
+		output.Stderr = fmt.Sprintf("error writing to file %s: %v", filePath, err)
+		return output
 	}
 
-	// Create a pipe for capturing the command's stdout and stderr
 	getCmd := exec.Command(command, cmdArgs...)
 	stdoutPipe, err := getCmd.StdoutPipe()
 	if err != nil {
-		return fmt.Errorf("error creating stdout pipe: %v", err)
+		output.Stderr = fmt.Sprintf("error creating stdout pipe: %v", err)
+		return output
 	}
 	stderrPipe, err := getCmd.StderrPipe()
 	if err != nil {
-		return fmt.Errorf("error creating stderr pipe: %v", err)
+		output.Stderr = fmt.Sprintf("error creating stderr pipe: %v", err)
+		return output
 	}
 
-	// Start the command
 	err = getCmd.Start()
 	if err != nil {
-		return fmt.Errorf("error starting command: %v", err)
+		output.Stderr = fmt.Sprintf("error starting command: %v", err)
+		return output
 	}
 
-	// Copy stdout to the log file
 	_, err = io.Copy(writer, stdoutPipe)
 	if err != nil {
-		return fmt.Errorf("error copying stdout to file: %v", err)
+		output.Stderr = fmt.Sprintf("error copying stdout to file: %v", err)
+		return output
 	}
 
-	// Copy stderr to the log file
 	_, err = io.Copy(writer, stderrPipe)
 	if err != nil {
-		return fmt.Errorf("error copying stderr to file: %v", err)
+		output.Stderr = fmt.Sprintf("error copying stderr to file: %v", err)
+		return output
 	}
 
-	// Wait for the command to finish
 	err = getCmd.Wait()
 	if err != nil {
-		return fmt.Errorf("error running kubectl get command for resource %s: %v", resource.Name, err)
+		output.Stderr = fmt.Sprintf("error running kubectl get command for resource %s: %v", resource.Name, err)
+		return output
 	}
 
-	fmt.Printf("Output written to file %s\n", filePath)
+	fmt.Printf("Writing %s\n", filePath)
+
+	return output
+}
+
+func concatenateLogs(outputDir string) error {
+	logFilePath := filepath.Join(outputDir, "log.txt")
+	logFile, err := os.Create(logFilePath)
+	if err != nil {
+		return fmt.Errorf("error creating log file %s: %v", logFilePath, err)
+	}
+	defer logFile.Close()
+
+	writer := bufio.NewWriter(logFile)
+	defer writer.Flush()
+
+	err = filepath.Walk(outputDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			if path != logFilePath {
+				file, err := os.Open(path)
+				if err != nil {
+					return fmt.Errorf("error opening file %s: %v", path, err)
+				}
+				defer file.Close()
+
+				_, err = io.Copy(writer, file)
+				if err != nil {
+					return fmt.Errorf("error copying file contents to log file: %v", err)
+				}
+
+				_, err = writer.Write([]byte("\n\n"))
+				if err != nil {
+					return fmt.Errorf("error appending newline: %v", err)
+				}
+
+			}
+		}
+		return nil
+	})
+
+	if err != nil {
+		return fmt.Errorf("error walking through directory %s: %v", outputDir, err)
+	}
+
+	fmt.Printf("Logs concatenated to file %s\n", logFilePath)
 
 	return nil
 }
