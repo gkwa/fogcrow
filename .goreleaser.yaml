@@ -37,7 +37,7 @@ changelog:
     - '^docs:'
     - '^test:'
 brews:
-- name: cloudelf
+- name: fogcrow
   directory: Formula
   homepage: https://github.com/taylormonacelli/homebrew-tools
   repository:
